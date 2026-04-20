@@ -17,11 +17,18 @@ An AI-powered screenplay analysis system that reads a PDF script and produces de
    - [Node 3: Engagement Score](#node-3-engagement-score)
    - [Node 4: Improvement Suggestions](#node-4-improvement-suggestions)
    - [Node 5: Cliffhanger Detection](#node-5-cliffhanger-detection)
-6. [Model Strategy — GPT-4o vs GPT-4o-mini](#6-model-strategy--gpt-4o-vs-gpt-4o-mini)
-7. [The Three Layers of Every Chunk](#7-the-three-layers-of-every-chunk)
-8. [Full Data Flow Diagram](#8-full-data-flow-diagram)
-9. [Tech Stack](#9-tech-stack)
-10. [Setup and Running](#10-setup-and-running)
+6. [Production Infrastructure](#6-production-infrastructure)
+   - [Job Queue — Redis + Celery](#job-queue--redis--celery)
+   - [ChromaDB — Per-Job Isolated Storage](#chromadb--per-job-isolated-storage)
+   - [Rate Limiting](#rate-limiting)
+   - [LLM Retry Logic](#llm-retry-logic)
+   - [Cost Tracking](#cost-tracking)
+   - [Centralised Config](#centralised-config)
+7. [Model Strategy — GPT-4o vs GPT-4o-mini](#7-model-strategy--gpt-4o-vs-gpt-4o-mini)
+8. [The Three Layers of Every Chunk](#8-the-three-layers-of-every-chunk)
+9. [Full Data Flow Diagram](#9-full-data-flow-diagram)
+10. [Tech Stack](#10-tech-stack)
+11. [Setup and Running](#11-setup-and-running)
 
 ---
 
@@ -323,7 +330,222 @@ Semantic search finds scenes that *sound like* a cliffhanger. But sometimes a sc
 
 ---
 
-## 6. Model Strategy — GPT-4o vs GPT-4o-mini
+## 6. Production Infrastructure
+
+The analysis pipeline is powerful but expensive and slow — a single script can take 60–120 seconds and make 40+ OpenAI calls. Without production infrastructure, multiple users hitting the system simultaneously would cause rate limit crashes, users accidentally triggering duplicate analyses, and no visibility into costs. This section covers every layer added to make the system production-ready.
+
+---
+
+### Job Queue — Redis + Celery
+
+**The problem without a queue:**
+
+```
+User 1 uploads → 40 OpenAI calls start immediately
+User 2 uploads → 40 more OpenAI calls start immediately
+User 3 uploads → OpenAI rate limit hit → everything crashes
+```
+
+**How the queue works:**
+
+```
+User uploads script
+    │
+    ▼
+app.py extracts raw text from PDF
+    │
+    ▼
+analyse_script.delay(title, raw_text)   ← submits job to Redis, returns job_id instantly
+    │
+    ▼
+Celery worker (separate process) picks job off queue
+    │
+    ├── Runs ingestion + ChromaDB indexing
+    ├── Runs LangGraph pipeline
+    └── Stores result in Redis under job_id
+    │
+    ▼
+app.py polls AsyncResult(job_id) every 3 seconds
+    │
+    ▼
+When job.state == SUCCESS → fetch result → render UI
+```
+
+**Redis** acts as two things simultaneously:
+- **Message broker** — holds the queue of pending jobs ("here are jobs waiting to be processed")
+- **Result backend** — stores completed job results for 1 hour so the UI can retrieve them
+
+**Celery** is the worker layer. It pulls jobs off the Redis queue and processes them. Key configuration decisions:
+
+| Setting | Value | Why |
+|---|---|---|
+| `task_acks_late=True` | Enabled | Only marks job as done after it completes. If the worker crashes mid-analysis, the job goes back to the queue instead of being lost |
+| `task_reject_on_worker_lost=True` | Enabled | If the worker process dies, the job is requeued automatically |
+| `result_expires=3600` | 1 hour | Results stay in Redis for 1 hour — enough time to view them, doesn't clog memory forever |
+| `worker_pool=gevent` | gevent | Windows-compatible pool. Default prefork pool fails on Windows due to multiprocessing restrictions |
+| `worker_concurrency=4` | 4 | 4 analyses can run in parallel — configurable via `CELERY_MAX_WORKERS` in `.env` |
+| `task_soft_time_limit=600` | 10 min | Raises an exception if a job runs longer than 10 minutes, preventing stuck jobs |
+| `task_time_limit=660` | 11 min | Hard kill 60 seconds after soft limit — guaranteed termination |
+
+**Files:**
+- [`celery_app.py`](celery_app.py) — Celery instance and all configuration
+- [`tasks.py`](tasks.py) — The `analyse_script` task definition
+
+---
+
+### ChromaDB — Per-Job Isolated Storage
+
+**The problem without isolation:**
+
+Without job-scoped storage, multiple users writing to ChromaDB simultaneously would overwrite each other's collections, mix up scene data between users, and produce wrong analysis results.
+
+**How it works:**
+
+Every Celery job gets its own isolated ChromaDB directory:
+
+```
+./chroma_db/
+    ├── a3f92b1c-.../ ← Job 1's ChromaDB (User 1)
+    ├── 7d84e209-.../ ← Job 2's ChromaDB (User 2)
+    └── 1bc30f44-.../ ← Job 3's ChromaDB (User 3)
+```
+
+Each job passes `persist_path=f"./chroma_db/{job_id}"` to `store_chunks_in_chromadb()`. ChromaDB creates a `PersistentClient` at that path — completely isolated from all other jobs.
+
+**Cleanup:** The `tasks.py` `finally` block always deletes the job's ChromaDB directory after the pipeline finishes, even if the job failed. This prevents disk accumulation.
+
+```
+finally:
+    shutil.rmtree(chroma_path, ignore_errors=True)
+```
+
+In development (no Celery), `persist_path=None` uses `EphemeralClient()` in-memory — no disk required.
+
+---
+
+### Rate Limiting
+
+**The problem without rate limiting:**
+
+One user (or a script) can submit unlimited analyses, burning through your OpenAI budget in minutes.
+
+**How it works:**
+
+Redis stores a counter per session:
+
+```
+Key:   rate_limit:{session_id}
+Value: 3                          ← number of analyses this hour
+TTL:   3600 seconds               ← auto-expires after 1 hour
+```
+
+On every submit:
+1. Increment the counter
+2. If counter > limit → block the request and show an error
+3. Counter auto-resets after the TTL window expires
+
+**Fail open:** If Redis is unavailable, the rate limiter returns `allowed=True`. A Redis outage should not take down the whole app — it degrades gracefully to no rate limiting rather than blocking all users.
+
+**Configuration (`.env`):**
+```
+RATE_LIMIT_MAX=5       # max analyses per session per window
+RATE_LIMIT_WINDOW=3600 # window duration in seconds (1 hour)
+```
+
+**File:** [`rate_limiter.py`](rate_limiter.py)
+
+---
+
+### LLM Retry Logic
+
+**The problem without retries:**
+
+OpenAI's API occasionally returns rate limit errors (`429`) or connection drops, especially under parallel load. Without retries, one transient error fails the entire analysis.
+
+**How it works:**
+
+Every `call_llm()` is wrapped with `tenacity` — a retry library:
+
+```
+call_llm() fails with RateLimitError
+    │
+    ▼
+Wait 2 seconds (exponential backoff starts)
+    │
+    ▼
+Retry #1 → fails again
+    │
+    ▼
+Wait 4 seconds
+    │
+    ▼
+Retry #2 → succeeds → continues normally
+```
+
+**Retry configuration:**
+
+| Setting | Value | Why |
+|---|---|---|
+| Retries on | `RateLimitError`, `APIConnectionError`, `APITimeoutError` | Only retry transient errors, not auth failures or bad requests |
+| Max attempts | 3 | Beyond 3 retries the API is likely seriously degraded |
+| Min wait | 2 seconds | Gives the API time to recover from a brief spike |
+| Max wait | 30 seconds | Exponential backoff caps here — prevents 5-minute waits |
+| `reraise=True` | Enabled | After all retries exhausted, raises the original exception so the Celery task can handle it |
+
+**File:** [`llm.py`](llm.py)
+
+---
+
+### Cost Tracking
+
+**The problem without tracking:**
+
+You have no idea what each analysis costs. A bug that causes infinite retries or sends enormous prompts could cost hundreds of dollars before you notice.
+
+**How it works:**
+
+Every `call_llm()` call reads the `usage` object from OpenAI's response (input tokens + output tokens) and adds the cost to a thread-safe session accumulator.
+
+Cost rates stored in `config.py`:
+```
+GPT-4o:       $2.50 / 1M input tokens,  $10.00 / 1M output tokens
+GPT-4o-mini:  $0.15 / 1M input tokens,  $0.60 / 1M output tokens
+text-embedding-3-small: $0.02 / 1M tokens
+```
+
+After each analysis completes, the UI shows:
+```
+✓ 28 scenes analysed · Cost: $0.0842 · 47 LLM calls · 38,291 total tokens
+```
+
+The accumulator is thread-safe (uses a `threading.Lock`) so parallel LLM calls from the engagement and suggestions nodes don't corrupt the counter.
+
+**File:** [`llm.py`](llm.py) — `get_session_cost()`, `reset_session_cost()`, `_track_cost()`
+
+---
+
+### Centralised Config
+
+All configurable values live in one file — [`config.py`](config.py). No more hunting through multiple files to change a model name or rate limit.
+
+```python
+# config.py controls:
+FAST_MODEL           = "gpt-4o-mini"
+SMART_MODEL          = "gpt-4o"
+REDIS_URL            = "redis://localhost:6379/0"
+CELERY_MAX_WORKERS   = 4
+RATE_LIMIT_MAX       = 5
+RATE_LIMIT_WINDOW    = 3600
+LLM_MAX_RETRIES      = 3
+CHROMA_BASE_DIR      = "./chroma_db"
+COST_PER_1M          = { ... }  # pricing table
+```
+
+Everything reads from environment variables first, with sensible defaults. To change any behaviour in production, update `.env` — no code changes needed.
+
+---
+
+## 7. Model Strategy — GPT-4o vs GPT-4o-mini
 
 | Task | Model | Why |
 |---|---|---|
@@ -340,7 +562,7 @@ The rule: **cheap model for narrow tasks, smart model for synthesis and judgment
 
 ---
 
-## 7. The Three Layers of Every Chunk
+## 8. The Three Layers of Every Chunk
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -364,7 +586,7 @@ The rule: **cheap model for narrow tasks, smart model for synthesis and judgment
 
 ---
 
-## 8. Full Data Flow Diagram
+## 9. Full Data Flow Diagram
 
 ```
 PDF Upload
@@ -432,44 +654,93 @@ Streamlit UI renders all results
 
 ---
 
-## 9. Tech Stack
+## 10. Tech Stack
 
 | Component | Technology | Why |
 |---|---|---|
 | LLM (smart) | GPT-4o | Best reasoning for synthesis tasks |
 | LLM (fast) | GPT-4o-mini | Cheap and fast for narrow per-chunk tasks |
 | Embeddings | text-embedding-3-small | Best cost/quality ratio for semantic search |
-| Vector Store | ChromaDB (EphemeralClient) | In-memory, no setup required, cosine similarity |
+| Vector Store | ChromaDB (PersistentClient) | Per-job isolated storage on disk, cosine similarity |
 | Pipeline Orchestration | LangGraph | Stateful multi-node graph with parallel + sequential control |
+| Job Queue Broker | Redis | Holds pending jobs and stores completed results |
+| Async Task Worker | Celery + gevent | Processes analyses in background, Windows-compatible pool |
+| Rate Limiting | Redis counter | Per-session request limiting with auto-expiry TTL |
+| LLM Resilience | tenacity | Exponential backoff retry on rate limits and connection drops |
+| Cost Tracking | Custom accumulator | Token-level cost tracking per session, thread-safe |
 | PDF Parsing | PyPDF2 | Extract raw text from uploaded screenplay PDFs |
 | Output Validation | Pydantic | Type-safe structured outputs from LLM responses |
-| Frontend | Streamlit | Fast web UI with file upload and result rendering |
-| Environment | python-dotenv | Load API keys securely from .env |
+| Frontend | Streamlit | Web UI with job submission, polling, and result rendering |
+| Config Management | python-dotenv + config.py | All settings in one place, env-var driven |
 
 ---
 
-## 10. Setup and Running
+## 11. Setup and Running
 
 ### Prerequisites
 
 - Python 3.10+
 - OpenAI API key
+- Redis (via Docker or native install)
 
-### Install
+### Install dependencies
 
 ```bash
 pip install -r requirements.txt
+pip install gevent   # Windows-compatible Celery pool
 ```
 
 ### Configure
 
-Create a `.env` file in the `script_analysis/` directory:
+Edit `.env` in the `script_analysis/` directory:
 
-```
+```env
 OPENAI_API_KEY=sk-your-key-here
+
+# Redis
+REDIS_URL=redis://localhost:6379/0
+
+# Celery
+CELERY_MAX_WORKERS=4
+CELERY_TASK_TIMEOUT=600
+
+# Rate limiting
+RATE_LIMIT_MAX=5
+RATE_LIMIT_WINDOW=3600
+
+# LLM retries
+LLM_MAX_RETRIES=3
+LLM_RETRY_MIN_WAIT=2
+LLM_RETRY_MAX_WAIT=30
+
+# ChromaDB storage path
+CHROMA_BASE_DIR=./chroma_db
 ```
 
-### Run
+### Start Redis
+
+```bash
+# Using Docker (recommended)
+docker run -d -p 6379:6379 --name redis redis
+
+# Verify it's running
+redis-cli ping   # should return: PONG
+```
+
+### Start Celery worker (Terminal 1)
+
+```bash
+cd script_analysis
+celery -A celery_app.celery_app worker --loglevel=info -Q analysis
+```
+
+You should see this on startup — confirming the task is registered:
+```
+[tasks]
+  . tasks.analyse_script
+```
+
+### Start Streamlit (Terminal 2)
 
 ```bash
 cd script_analysis
@@ -480,10 +751,10 @@ streamlit run app.py
 
 1. Upload a PDF screenplay
 2. Enter the script title
-3. Click **Analyse Script**
-4. Wait for ingestion (chunking + parallel summarisation)
-5. Wait for pipeline (5 analysis nodes)
-6. View results and optionally export as JSON
+3. Click **Analyse Script** — job is submitted to the queue instantly
+4. UI polls every 3 seconds showing queue/progress status
+5. When complete, results render with scene count, cost, and token usage
+6. Optionally export full analysis as JSON
 
 ---
 

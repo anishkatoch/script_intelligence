@@ -80,7 +80,8 @@ def _chunk_by_size(text: str, chunk_size: int = 3600) -> List[Tuple[str, str]]:
 
 def store_chunks_in_chromadb(
     scenes: List[Tuple[str, str]],
-    collection_name: str = "script_chunks"
+    collection_name: str = "script_chunks",
+    persist_path: str = None,
 ) -> chromadb.Collection:
     """
     For each scene chunk:
@@ -88,10 +89,18 @@ def store_chunks_in_chromadb(
       - generates a vector embedding via text-embedding-3-small
       - generates a short LLM summary stored in metadata
 
-    This lets pipeline nodes choose between full text (detailed analysis)
-    and summary (broad context gathering) depending on the task.
+    persist_path: if provided, uses PersistentClient at that path (production).
+                  if None, uses EphemeralClient in-memory (dev/testing).
+
+    Each job should pass its own unique persist_path so multiple concurrent
+    users have fully isolated ChromaDB instances.
     """
-    client = chromadb.EphemeralClient()
+    if persist_path:
+        import os
+        os.makedirs(persist_path, exist_ok=True)
+        client = chromadb.PersistentClient(path=persist_path)
+    else:
+        client = chromadb.EphemeralClient()
 
     try:
         client.delete_collection(collection_name)

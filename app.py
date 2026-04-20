@@ -2,12 +2,17 @@ import streamlit as st
 import os
 import re
 import json
+import time
 from dotenv import load_dotenv
+from celery.result import AsyncResult
 
 load_dotenv()
 
-from ingestion import extract_text_from_pdf, detect_scenes, store_chunks_in_chromadb
-from pipeline import run_analysis
+from ingestion import extract_text_from_pdf
+from tasks import analyse_script
+from celery_app import celery_app
+from rate_limiter import check_rate_limit, get_usage
+from llm import get_session_cost, reset_session_cost
 
 # ─── Page Config ─────────────────────────────────────────────────────────────
 
@@ -381,41 +386,93 @@ with col_info:
 st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
 
 if uploaded_file and script_title:
-    if st.button("▶  Analyse Script"):
 
-        # ── Ingestion ──
-        with st.spinner("Extracting & indexing script..."):
+    # ── Session state initialisation ─────────────────────────────────────────
+    for key, default in [("job_id", None), ("results", None), ("raw_text", None)]:
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+    # ── Rate limit display ────────────────────────────────────────────────────
+    session_id = st.session_state.get("_session_id") or id(st.session_state)
+    st.session_state["_session_id"] = session_id
+    usage = get_usage(str(session_id))
+    st.markdown(
+        f'<div style="font-family: DM Mono, monospace; font-size: 0.65rem; color: #555555; margin-bottom: 0.5rem">'
+        f'Analyses used: {usage["count"]}/{usage["limit"]} this hour</div>',
+        unsafe_allow_html=True
+    )
+
+    # ── Submit button ─────────────────────────────────────────────────────────
+    job_running = st.session_state.job_id is not None and st.session_state.results is None
+
+    if st.button("▶  Analyse Script", disabled=job_running):
+        allowed, count, remaining = check_rate_limit(str(session_id))
+        if not allowed:
+            st.error(f"Rate limit reached — you've used {count} analyses this hour. Please wait before trying again.")
+        else:
+            reset_session_cost()
             raw_text = extract_text_from_pdf(uploaded_file)
-            scenes_raw = detect_scenes(raw_text)
-            scenes = [
-                {"scene_index": i, "scene_title": title, "text": text}
-                for i, (title, text) in enumerate(scenes_raw)
-            ]
-            safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', script_title[:20]).strip('_') or "script"
-            collection = store_chunks_in_chromadb(scenes_raw, collection_name=f"script_{safe_title}")
+            st.session_state.raw_text = raw_text
 
-        st.markdown(f"""
-        <div style="font-family: 'DM Mono', monospace; font-size: 0.75rem; color: #555555; margin-bottom: 1.5rem">
-            ✓ Detected {len(scenes)} scenes · {len(raw_text):,} characters · Indexed in ChromaDB
-        </div>
-        """, unsafe_allow_html=True)
+            # Submit job to Celery queue — returns immediately
+            job = analyse_script.delay(script_title, raw_text)
+            st.session_state.job_id = job.id
+            st.session_state.results = None
+            st.rerun()
 
-        # ── Analysis Steps Progress ──
-        steps = ["Summary", "Emotional Arc", "Engagement", "Suggestions", "Cliffhanger"]
+    # ── Polling — runs on every rerun while job is pending ───────────────────
+    if st.session_state.job_id and st.session_state.results is None:
+        job = AsyncResult(st.session_state.job_id, app=celery_app)
+
         progress_bar = st.progress(0)
         step_text = st.empty()
 
-        def update_progress(step_num, step_name):
-            progress_bar.progress((step_num) / len(steps))
-            step_text.markdown(f'<div class="step-indicator">Analysing → <span class="step-active">{step_name}</span></div>', unsafe_allow_html=True)
+        if job.state == "PENDING":
+            progress_bar.progress(0.05)
+            step_text.markdown('<div class="step-indicator">Waiting in queue...</div>', unsafe_allow_html=True)
 
-        update_progress(0, "Summary")
+        elif job.state == "PROGRESS":
+            step = job.info.get("step", "Processing...") if job.info else "Processing..."
+            progress_bar.progress(0.3)
+            step_text.markdown(f'<div class="step-indicator">Analysing → <span class="step-active">{step}</span></div>', unsafe_allow_html=True)
 
-        # ── Run Pipeline ──
-        results = run_analysis(script_title, raw_text, scenes, collection)
+        elif job.state == "SUCCESS":
+            progress_bar.progress(1.0)
+            step_text.markdown('<div class="step-indicator" style="color: #2e7d32">✓ Analysis complete</div>', unsafe_allow_html=True)
+            st.session_state.results = job.result["results"]
+            st.session_state.job_id = None
+            st.rerun()
 
-        progress_bar.progress(1.0)
-        step_text.markdown('<div class="step-indicator" style="color: #44cc88">✓ Analysis complete</div>', unsafe_allow_html=True)
+        elif job.state == "FAILURE":
+            progress_bar.empty()
+            step_text.empty()
+            st.error(f"Analysis failed: {str(job.result)}")
+            st.session_state.job_id = None
+
+        else:
+            progress_bar.progress(0.5)
+            step_text.markdown(f'<div class="step-indicator">Status: {job.state}</div>', unsafe_allow_html=True)
+
+        # Poll every 3 seconds
+        time.sleep(3)
+        st.rerun()
+
+    # ── Results available ─────────────────────────────────────────────────────
+    if st.session_state.results:
+        results = st.session_state.results
+        raw_text = st.session_state.raw_text or ""
+
+        # Cost summary
+        cost = get_session_cost()
+        st.markdown(
+            f'<div style="font-family: DM Mono, monospace; font-size: 0.65rem; color: #555555; margin-bottom: 1rem">'
+            f'✓ {len(results.get("scenes", []))} scenes analysed · '
+            f'Cost: ${cost["total_usd"]:.4f} · '
+            f'{cost["calls"]} LLM calls · '
+            f'{cost["input_tokens"] + cost["output_tokens"]:,} total tokens'
+            f'</div>',
+            unsafe_allow_html=True
+        )
 
         st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
 
